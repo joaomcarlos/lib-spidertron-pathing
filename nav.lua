@@ -61,10 +61,10 @@ local function goal_blacklisted(entity, pos)
   return t ~= nil and (game.tick - t) < GOAL_BLACKLIST_TTL
 end
 
---- Collision mask for the spider's path requests. `player` is the layer
---- that makes a tile impassable to a walker: deep water, lava, ammonia
---- ocean and out-of-map all carry it, while Fulgora oil ocean and Gleba
---- shallows lack it — spiders walk those (crust, reduced speed).
+--- Collision mask for the default spider path requests. `player` is the
+--- layer that makes a tile impassable to a walker: deep water, lava,
+--- ammonia ocean and out-of-map all carry it, while Fulgora oil ocean and
+--- Gleba shallows lack it — spiders walk those (crust, reduced speed).
 --- colliding_with_tiles_only ignores every entity: legs step over cliffs,
 --- trees, buildings, trains. consider_tile_transitions checks the box
 --- center rather than the whole box, so the torso may overhang a shoreline
@@ -75,12 +75,59 @@ local SPIDER_PATH_MASK = {
   consider_tile_transitions = true,
 }
 
+local DEFAULT_SKIP_FALLBACK = {patrol = true}
+
+--- Vehicle hooks: spidertron defaults, overridable per order via opts so
+--- future non-spider callers can plug in their own accessors.
+local function entity_speed(entity, opts)
+  if opts and opts.speed_fn then
+    return math.abs(opts.speed_fn(entity) or 0)
+  end
+  return math.abs(entity.speed or 0)
+end
+
+local function stop_entity(entity, opts)
+  if opts and opts.stop_fn then
+    opts.stop_fn(entity)
+    return
+  end
+  entity.stop_spider()
+end
+
+--- Normalize order_move opts once; the result rides on nav.opts so tick,
+--- on_path_finished and cancel reuse the same settings for the whole leg.
+--- A bare string opts is accepted as shorthand for {purpose = string}.
+local function resolve_opts(opts)
+  if type(opts) == "string" then
+    opts = {purpose = opts}
+  end
+  opts = opts or {}
+  local skip = opts.skip_straightline_fallback or DEFAULT_SKIP_FALLBACK
+  if skip[1] ~= nil then
+    local set = {}
+    for _, p in ipairs(skip) do
+      set[p] = true
+    end
+    skip = set
+  end
+  return {
+    purpose = opts.purpose,
+    collision_mask = opts.collision_mask or SPIDER_PATH_MASK,
+    snap_to_land = opts.snap_to_land ~= false,
+    min_path_dist_sq = opts.min_path_dist_sq or MIN_PATH_DIST_SQ,
+    skip_straightline_fallback = skip,
+    request_tag = opts.request_tag,
+    speed_fn = opts.speed_fn,
+    stop_fn = opts.stop_fn,
+  }
+end
+
 --- Resolve a finished path request id to its owner token ({tag, purpose}).
 --- Consumers call this from on_script_path_request_finished to find their
 --- record; nil means the request wasn't made by this lib. Also un-tracks
 --- the id, so stale completions die here.
 ---@param request_id number
----@return table?  {tag = entity.unit_number, purpose = string}
+---@return table?  {tag = opts.request_tag or entity.unit_number, purpose = string}
 function Pathing.take_request(request_id)
   local s = storage.lib_pathing
   local reqs = s and s.requests
@@ -107,16 +154,18 @@ local function request_path(rec)
   if not (nav and nav.goal and entity and entity.valid) then
     return
   end
+  local opts = nav.opts or {}
+  local min_dist_sq = opts.min_path_dist_sq or MIN_PATH_DIST_SQ
   --- Short hops gain nothing from pathfinding; keep the request budget for
   --- the long water/cliff detours that actually need it.
-  if Util.distance_sq(entity.position, nav.goal) < MIN_PATH_DIST_SQ then
+  if Util.distance_sq(entity.position, nav.goal) < min_dist_sq then
     return
   end
   --- Combat orbit/evade updates shift the goal a few tiles every 20 ticks;
   --- don't churn the pathfinder for them. When the goal barely moved and a
   --- request is already in flight, keep waiting for it — orphaning it and
   --- refusing to re-request left spiders standing forever.
-  if nav.path_goal and Util.distance_sq(nav.path_goal, nav.goal) < MIN_PATH_DIST_SQ then
+  if nav.path_goal and Util.distance_sq(nav.path_goal, nav.goal) < min_dist_sq then
     return
   end
   if nav.request_id then
@@ -127,7 +176,7 @@ local function request_path(rec)
   local ok, request_id = pcall(function()
     return entity.surface.request_path {
       bounding_box = entity.prototype.collision_box,
-      collision_mask = SPIDER_PATH_MASK,
+      collision_mask = opts.collision_mask or SPIDER_PATH_MASK,
       start = entity.position,
       goal = nav.goal,
       force = entity.force,
@@ -139,7 +188,7 @@ local function request_path(rec)
   if ok and request_id then
     nav.request_id = request_id
     nav.request_since = game.tick
-    track_request(request_id, entity.unit_number, nav.purpose or "command")
+    track_request(request_id, opts.request_tag or entity.unit_number, nav.purpose or "command")
   elseif not ok then
     log("lib-spidertron-pathing: request_path failed: " .. tostring(request_id))
   end
@@ -188,9 +237,9 @@ local function feed_waypoints(entity, nav)
   end
 end
 
---- Order a spider to `goal`. Must:
+--- Order an entity to `goal`. Must:
 ---  - set rec.nav = {goal=goal, request_id=?, waypoints=nil, wp_index=?,
----    stall_since=?, repath_count=0}
+---    stall_since=?, repath_count=0, opts=resolved}
 ---  - immediately set entity.autopilot_destination = goal so it starts walking
 ---  - fire surface.request_path (bounding_box from entity prototype,
 ---    collision mask appropriate for spider-vehicle: blocks on `player`-layer
@@ -199,12 +248,18 @@ end
 ---  - if request_path errors (pcall), leave vanilla autopilot to handle it
 ---@param rec table    {entity=LuaEntity, nav=lib-owned table}
 ---@param goal MapPosition
----@param purpose string?  free-form purpose tag (e.g. "patrol", "command")
-function Pathing.order_move(rec, goal, purpose)
+---@param opts table|string?  {purpose=string, collision_mask=table
+---       (default SPIDER_PATH_MASK), snap_to_land=bool (default true),
+---       min_path_dist_sq=n, skip_straightline_fallback=set|array
+---       (default {"patrol"}), request_tag=any (default unit_number),
+---       speed_fn=fun(entity)->n, stop_fn=fun(entity)};
+---       a bare string is treated as {purpose = string}
+function Pathing.order_move(rec, goal, opts)
   local entity = rec.entity
   if not (entity and entity.valid and goal) then
     return
   end
+  local o = resolve_opts(opts)
   --- A superseding order invalidates any in-flight request for the old goal.
   local old_nav = rec.nav
   if old_nav and old_nav.request_id then
@@ -212,7 +267,7 @@ function Pathing.order_move(rec, goal, purpose)
   end
   --- A goal sitting on water is unreachable: snap it to the nearest shore
   --- (patrol/engage points, stray remote clicks) instead of stalling.
-  local snapped = Util.nearest_land(entity.surface, goal, 32)
+  local snapped = o.snap_to_land and Util.nearest_land(entity.surface, goal, 32) or goal
   rec.nav = {
     goal = {x = snapped.x, y = snapped.y},
     request_id = nil,
@@ -222,7 +277,8 @@ function Pathing.order_move(rec, goal, purpose)
     repath_count = 0,
     retry_count = 0,
     use_queue = nil,
-    purpose = purpose,
+    purpose = o.purpose,
+    opts = o,
   }
   local nav = rec.nav
   --- Compute the route FIRST: the entity waits for the path and then walks
@@ -283,6 +339,7 @@ function Pathing.on_path_finished(rec, event)
   if not (entity and entity.valid and nav.goal) then
     return
   end
+  local opts = nav.opts or {}
   local path = event.path
 
   if event.try_again_later then
@@ -310,11 +367,12 @@ function Pathing.on_path_finished(rec, event)
       nav.path_goal = nil --- retry must bypass the same-goal dedupe
       request_path(rec)
     else
-      --- No passable route exists. Patrol straight-lines are pointless —
-      --- the ring point is dead-marked and skipped anyway — so only
-      --- non-patrol goals (mission, resupply, command) get the fallback.
+      --- No passable route exists. Goals whose purpose is in the
+      --- skip_straightline_fallback set (patrol by default: the ring point
+      --- is dead-marked and skipped anyway) don't get the fallback — only
+      --- purposes that need arrival (mission, resupply, command) do.
       blacklist_map()[goal_key(entity.surface.index, nav.goal)] = game.tick
-      if nav.purpose ~= "patrol" then
+      if not opts.skip_straightline_fallback[nav.purpose] then
         pcall(function()
           entity.autopilot_destination = nav.goal
         end)
@@ -395,7 +453,7 @@ function Pathing.tick(rec)
     nav.path_goal = nil
   end
 
-  local speed = math.abs(entity.speed or 0)
+  local speed = entity_speed(entity, nav.opts)
   if speed > STALL_SPEED then
     nav.stall_since = nil
     return
@@ -432,8 +490,8 @@ function Pathing.tick(rec)
   else
     --- Same rule: straight-line fallback beats freezing — the autopilot
     --- straddles what it can — but only for goals that need arrival.
-    --- Patrol points get dead-marked and skipped.
-    if nav.purpose ~= "patrol" then
+    --- Skipped purposes (patrol by default) get dead-marked and skipped.
+    if not nav.opts.skip_straightline_fallback[nav.purpose] then
       pcall(function()
         entity.autopilot_destination = nav.goal
       end)
@@ -513,7 +571,7 @@ function Pathing.arrived(rec)
   if Util.distance_sq(entity.position, nav.goal) > ARRIVE_DIST_SQ then
     return false
   end
-  return math.abs(entity.speed or 0) <= STALL_SPEED
+  return entity_speed(entity, nav.opts) <= STALL_SPEED
 end
 
 --- Call on defines.events.on_spider_command_completed (entity reached its
@@ -591,7 +649,7 @@ function Pathing.cancel(rec)
   if entity and entity.valid then
     pcall(function()
       entity.autopilot_destination = nil
-      entity.stop_spider()
+      stop_entity(entity, nav and nav.opts)
     end)
   end
   rec.nav = {}
