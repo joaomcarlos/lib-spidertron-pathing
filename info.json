@@ -1,0 +1,11 @@
+{
+  "name": "lib-spidertron-pathing",
+  "version": "0.1.0",
+  "title": "Spidertron Pathing",
+  "author": "silent",
+  "factorio_version": "2.1",
+  "dependencies": [
+    "base >= 2.1.0"
+  ],
+  "description": "Shared spider-vehicle pathing and movement execution (async request_path refinement, waypoint queueing, stall watchdog)."
+}

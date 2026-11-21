@@ -1,0 +1,7 @@
+---------------------------------------------------------------------------------------------------
+Version: 0.1.0
+Date: 2026-11-21
+  Features:
+    - Initial release: spider-vehicle pathing as a shared library — vanilla
+      autopilot kick, async request_path refinement, waypoint thinning and
+      queueing, stall watchdog, goal blacklist.
