@@ -81,7 +81,7 @@ end)
 | `Pathing.take_request(request_id)` | Resolve a finished path request to `{tag, purpose}`; nil = foreign request |
 | `Pathing.on_path_finished(rec, event)` | Feed the raw `on_script_path_request_finished` event; staleness resolved internally |
 | `Pathing.on_command_completed(rec)` | Feed `on_spider_command_completed`; advances the waypoint queue |
-| `Pathing.tick(rec)` | Stall watchdog — bump waypoints, repath, or fail |
+| `Pathing.tick(rec)` | Stall watchdog: bump waypoints, repath, or fail |
 | `Pathing.arrived(rec)` | True when within ~4 tiles of `nav.goal` and ~stopped |
 | `Pathing.externally_driven(rec)` | True while a foreign destination (player route, another mod) drives the entity |
 | `Pathing.append_goal(rec, pos)` | Extend the current route with an extra goal (shift-click semantics) |

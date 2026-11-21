@@ -122,7 +122,7 @@ local function resolve_opts(opts)
   }
 end
 
---- Resolve a finished path request id to its owner token ({tag, purpose}).
+--- Resolve a finished path request id to its owner ({tag, purpose}).
 --- Consumers call this from on_script_path_request_finished to find their
 --- record; nil means the request wasn't made by this lib. Also un-tracks
 --- the id, so stale completions die here.

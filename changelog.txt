@@ -4,7 +4,7 @@ Date: 2026-11-21
   Bugfixes:
     - Real last-meter logic: when the route is consumed (or a straight-line
       order), the tick loop re-asserts the goal every time the autopilot
-      destination lapses or the spider stops short — a genuine
+      destination lapses or the spider stops short: a genuine
       brake-and-settle approach instead of mid-flight pass-throughs that
       burned the old 3-assert budget. Bounded at 6, then the stall
       watchdog repaths as before. Covers waypoint routes and <20-tile
@@ -22,6 +22,6 @@ Date: 2026-11-21
 Version: 0.1.0
 Date: 2026-11-21
   Features:
-    - Initial release: spider-vehicle pathing as a shared library — vanilla
+    - Initial release: spider-vehicle pathing as a shared library: vanilla
       autopilot kick, async request_path refinement, waypoint thinning and
       queueing, stall watchdog, goal blacklist.

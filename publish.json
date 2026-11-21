@@ -1,0 +1,10 @@
+{
+  "include": [
+    "info.json",
+    "changelog.txt",
+    "nav.lua",
+    "lib/util.lua",
+    "README.md",
+    "thumbnail.png"
+  ]
+}
