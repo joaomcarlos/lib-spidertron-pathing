@@ -478,6 +478,15 @@ function Pathing.tick(rec)
       feed_waypoints(entity, nav)
       return
     end
+    --- Route consumed but it stopped past the goal: same re-assert as the
+    --- command-completed path, before falling through to repath.
+    if (nav.settle_count or 0) < 3 then
+      nav.settle_count = (nav.settle_count or 0) + 1
+      pcall(function()
+        entity.autopilot_destination = nav.goal
+      end)
+      return
+    end
   end
 
   --- Out of waypoints (or none yet): re-request the path a few times, then
@@ -592,7 +601,18 @@ function Pathing.on_command_completed(rec)
   end
   sync_wp_index(entity, nav)
   if nav.wp_index > #nav.waypoints then
-    return --- final waypoint consumed; the consumer notices via Pathing.arrived
+    --- The engine drops the last destination the moment its reach
+    --- tolerance hits, so a fast spider coasts past the goal with nothing
+    --- pulling it back. Re-assert the goal (bounded) so the autopilot does
+    --- a fresh brake-and-settle onto it — same as the player clicking the
+    --- destination again. Skipped once actually arrived/stopped.
+    if (nav.settle_count or 0) < 3 and not Pathing.arrived(rec) then
+      nav.settle_count = (nav.settle_count or 0) + 1
+      pcall(function()
+        entity.autopilot_destination = nav.goal
+      end)
+    end
+    return
   end
   --- With queue feeding the engine is already targeting this node; only push
   --- it ourselves when nothing matching is queued (manual-stepping fallback).
@@ -623,6 +643,7 @@ function Pathing.append_goal(rec, position)
   nav.waypoints[#nav.waypoints + 1] = position
   nav.goal = position
   nav.failed = nil
+  nav.settle_count = nil --- extended route gets its own settle budget
 end
 
 --- Drop route bookkeeping without touching the entity: un-tracks any

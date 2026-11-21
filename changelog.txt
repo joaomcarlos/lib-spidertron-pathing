@@ -1,4 +1,13 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.1.1
+Date: 2026-11-21
+  Bugfixes:
+    - Fast spiders no longer coast past the final waypoint: when the route's
+      last node is consumed the goal is re-asserted (bounded, up to 3 times)
+      so the autopilot performs a fresh brake-and-settle onto it instead of
+      overshooting. Stall-watchdog path uses the same settle re-assert before
+      repathing.
+---------------------------------------------------------------------------------------------------
 Version: 0.1.0
 Date: 2026-11-21
   Features:
