@@ -1,4 +1,15 @@
 ---------------------------------------------------------------------------------------------------
+Version: 0.1.2
+Date: 2026-11-21
+  Bugfixes:
+    - Real last-meter logic: when the route is consumed (or a straight-line
+      order), the tick loop re-asserts the goal every time the autopilot
+      destination lapses or the spider stops short — a genuine
+      brake-and-settle approach instead of mid-flight pass-throughs that
+      burned the old 3-assert budget. Bounded at 6, then the stall
+      watchdog repaths as before. Covers waypoint routes and <20-tile
+      straight-line orders alike.
+---------------------------------------------------------------------------------------------------
 Version: 0.1.1
 Date: 2026-11-21
   Bugfixes:

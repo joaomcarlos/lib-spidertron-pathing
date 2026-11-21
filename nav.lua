@@ -453,6 +453,26 @@ function Pathing.tick(rec)
     nav.path_goal = nil
   end
 
+  --- Last-meter settle: the engine drops the autopilot destination at its
+  --- own reach tolerance, so a fast spider coasts past the goal. Once the
+  --- route is consumed (or a straight-line order), re-assert the goal
+  --- every time the destination lapses or the spider stops short — each
+  --- assert is a real brake-and-settle approach like the player clicking
+  --- again, not a mid-flight pass-through. Bounded; beyond it the stall
+  --- watchdog repaths as before.
+  local route_done = not nav.waypoints or (nav.wp_index or 1) > #nav.waypoints
+  if route_done and nav.goal and not nav.failed and not Pathing.arrived(rec) then
+    local dest = entity.autopilot_destination
+    if (not dest or Util.distance_sq(dest, nav.goal) > 4)
+      and (nav.settle_count or 0) < 6 then
+      nav.settle_count = (nav.settle_count or 0) + 1
+      pcall(function()
+        entity.autopilot_destination = nav.goal
+      end)
+      return
+    end
+  end
+
   local speed = entity_speed(entity, nav.opts)
   if speed > STALL_SPEED then
     nav.stall_since = nil
@@ -476,15 +496,6 @@ function Pathing.tick(rec)
     if nav.wp_index < #nav.waypoints then
       nav.wp_index = nav.wp_index + 1
       feed_waypoints(entity, nav)
-      return
-    end
-    --- Route consumed but it stopped past the goal: same re-assert as the
-    --- command-completed path, before falling through to repath.
-    if (nav.settle_count or 0) < 3 then
-      nav.settle_count = (nav.settle_count or 0) + 1
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
       return
     end
   end
