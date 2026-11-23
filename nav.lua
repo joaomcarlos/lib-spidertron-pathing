@@ -77,6 +77,32 @@ local SPIDER_PATH_MASK = {
 
 local DEFAULT_SKIP_FALLBACK = {patrol = true}
 
+--- Legs of a spider vehicle, nil for non-spider callers (the API errors
+--- off SpiderVehicle — a documented failure mode, not defensive niling).
+local function spider_legs(entity)
+  local ok, legs = pcall(function()
+    return entity.get_spider_legs()
+  end)
+  if ok then
+    return legs
+  end
+end
+
+--- Snap a goal sitting on blocked terrain to the nearest spot a leg can
+--- stand. find_non_colliding_position models the leg's real box and mask,
+--- so shorelines the tile probe in nearest_land can miss still resolve.
+--- Falls back to the ring scan for legless callers or no spot found.
+local function snap_goal(entity, goal)
+  local legs = spider_legs(entity)
+  if legs and legs[1] and legs[1].valid then
+    local pos = entity.surface.find_non_colliding_position(legs[1].name, goal, 10, 2)
+    if pos then
+      return pos
+    end
+  end
+  return Util.nearest_land(entity.surface, goal, 32)
+end
+
 --- Vehicle hooks: spidertron defaults, overridable per order via opts so
 --- future non-spider callers can plug in their own accessors.
 local function entity_speed(entity, opts)
@@ -267,7 +293,7 @@ function Pathing.order_move(rec, goal, opts)
   end
   --- A goal sitting on water is unreachable: snap it to the nearest shore
   --- (patrol/engage points, stray remote clicks) instead of stalling.
-  local snapped = o.snap_to_land and Util.nearest_land(entity.surface, goal, 32) or goal
+  local snapped = o.snap_to_land and snap_goal(entity, goal) or goal
   rec.nav = {
     goal = {x = snapped.x, y = snapped.y},
     request_id = nil,
