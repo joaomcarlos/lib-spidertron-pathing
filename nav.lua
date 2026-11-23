@@ -31,6 +31,8 @@ local MIN_PATH_DIST_SQ = 400   --- closer than ~20 tiles: vanilla autopilot is e
 local REQUEST_TIMEOUT = 300    --- ~5s: a request older than this is treated as lost
 local GOAL_BLACKLIST_TTL = 18000 --- ~5min: must outlast a fallback round-trip or the next spider just retries the dead goal
 local GOAL_KEY_Q = 8            --- goal positions quantized to 8-tile cells
+local STUCK_TICKS = 180         --- ~3s window for the position watchdog
+local STUCK_DIST_SQ = 2.25      --- moved <1.5 tiles inside the window = stuck
 
 --- Lib-owned persistent state, namespaced so consumers' storage keys stay
 --- untouched. Both tables are created lazily — the lib owns no lifecycle,
@@ -565,11 +567,38 @@ function Pathing.tick(rec)
   --- (event never resolves) and we fall through to repath/fail handling.
   if nav.request_id then
     if (game.tick - (nav.request_since or 0)) <= REQUEST_TIMEOUT then
+      --- Waiting on the pathfinder: restart the position window so a
+      --- just-applied route isn't repathed before it can move.
+      nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+      nav.stuck_tick = game.tick
       return
     end
     Pathing.take_request(nav.request_id)
     nav.request_id = nil
     nav.path_goal = nil
+  end
+
+  --- Position watchdog: the speed-based stall checks below miss a spider
+  --- shuffling in place or creeping just over STALL_SPEED — if it covered
+  --- less than ~1.5 tiles in ~180 ticks with a goal pending, drop whatever
+  --- the autopilot is doing and re-request the path.
+  local now = game.tick
+  if nav.stuck_pos and (now - (nav.stuck_tick or now)) >= STUCK_TICKS then
+    local moved = Util.distance_sq(entity.position, nav.stuck_pos)
+    nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+    nav.stuck_tick = now
+    if moved < STUCK_DIST_SQ and not nav.failed and not Pathing.arrived(rec) then
+      set_autopilot(entity, nav, nil)
+      nav.origin_idx = 0
+      nav.path_goal = nil
+      request_path(rec)
+      if nav.request_id then
+        return
+      end
+    end
+  elseif not nav.stuck_pos then
+    nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+    nav.stuck_tick = now
   end
 
   --- Last-meter settle: the engine drops the autopilot destination at its
