@@ -2,8 +2,10 @@
 --- Pathfinding and movement execution for one vehicle record.
 --- Goals: the entity starts moving immediately (vanilla autopilot), then the
 --- route is refined async via surface.request_path so it routes around
---- impassable tiles instead of pushing into them. Stalls are detected and
---- re-paths issued.
+--- impassable tiles instead of pushing into them; when the entity's own
+--- position is wedged the request retries from odd-indexed leg origins
+--- with each leg's collision mask. Stalls are detected and re-paths
+--- issued.
 ---
 --- Library module: no control.lua, no event registrations, no lifecycle
 --- hooks. Consumers require("__lib-spidertron-pathing__.nav"), keep
@@ -29,6 +31,8 @@ local MIN_PATH_DIST_SQ = 400   --- closer than ~20 tiles: vanilla autopilot is e
 local REQUEST_TIMEOUT = 300    --- ~5s: a request older than this is treated as lost
 local GOAL_BLACKLIST_TTL = 18000 --- ~5min: must outlast a fallback round-trip or the next spider just retries the dead goal
 local GOAL_KEY_Q = 8            --- goal positions quantized to 8-tile cells
+local STUCK_TICKS = 180         --- ~3s window for the position watchdog
+local STUCK_DIST_SQ = 2.25      --- moved <1.5 tiles inside the window = stuck
 
 --- Lib-owned persistent state, namespaced so consumers' storage keys stay
 --- untouched. Both tables are created lazily — the lib owns no lifecycle,
@@ -76,6 +80,109 @@ local SPIDER_PATH_MASK = {
 }
 
 local DEFAULT_SKIP_FALLBACK = {patrol = true}
+
+--- Legs of a spider vehicle, nil for non-spider callers (the API errors
+--- off SpiderVehicle — a documented failure mode, not defensive niling).
+local function spider_legs(entity)
+  local ok, legs = pcall(function()
+    return entity.get_spider_legs()
+  end)
+  if ok then
+    return legs
+  end
+end
+
+--- Collision mask for a leg-origin request: the leg's own mask plus the
+--- tiles-only/transition flags from SPIDER_PATH_MASK. A leg that already
+--- collides with `player`-layer tiles gets a vacuous mask instead: with
+--- colliding_with_tiles_only, pure entity layers collide with nothing, so
+--- the pathfinder straight-lines — a usable route beats none.
+local function leg_path_mask(leg)
+  local layers = leg.prototype.collision_mask.layers
+  if layers and layers["player"] then
+    layers = {large_entity = true}
+  end
+  return {
+    layers = layers,
+    colliding_with_tiles_only = true,
+    consider_tile_transitions = true,
+  }
+end
+
+--- Request origin for nav.origin_idx: 0 is the entity itself, 1..N are the
+--- odd-indexed legs (1,3,5,...). Legs straddle obstacles, so a leg origin
+--- succeeds where the wedged torso origin fails. A vanished origin resets
+--- to the entity.
+local function path_origin(rec)
+  local nav = rec.nav
+  local entity = rec.entity
+  local opts = nav.opts or {}
+  local idx = nav.origin_idx or 0
+  if idx > 0 then
+    local legs = spider_legs(entity)
+    local leg = legs and legs[idx * 2 - 1]
+    if leg and leg.valid then
+      return leg.position, leg.prototype.collision_box, leg_path_mask(leg)
+    end
+    nav.origin_idx = 0
+  end
+  return entity.position, entity.prototype.collision_box,
+    opts.collision_mask or SPIDER_PATH_MASK
+end
+
+--- Advance nav.origin_idx to the next valid odd-indexed leg. False when
+--- every leg has been tried (or the entity has none).
+local function next_leg_origin(entity, nav)
+  local legs = spider_legs(entity)
+  if not legs then
+    return false
+  end
+  local idx = (nav.origin_idx or 0) + 1
+  while true do
+    local leg = legs[idx * 2 - 1]
+    if not leg then
+      return false
+    end
+    if leg.valid then
+      nav.origin_idx = idx
+      return true
+    end
+    idx = idx + 1
+  end
+end
+
+--- Snap a goal sitting on blocked terrain to the nearest spot a leg can
+--- stand. find_non_colliding_position models the leg's real box and mask,
+--- so shorelines the tile probe in nearest_land can miss still resolve.
+--- Falls back to the ring scan for legless callers or no spot found.
+local function snap_goal(entity, goal)
+  local legs = spider_legs(entity)
+  if legs and legs[1] and legs[1].valid then
+    local pos = entity.surface.find_non_colliding_position(legs[1].name, goal, 10, 2)
+    if pos then
+      return pos
+    end
+  end
+  return Util.nearest_land(entity.surface, goal, 32)
+end
+
+local function same_pos(a, b)
+  return a and b and math.abs(a.x - b.x) < 0.75 and math.abs(a.y - b.y) < 0.75
+end
+
+--- autopilot_destination write that records what we set in nav.dest_set
+--- ({x,y}, or false for a clear). on_path_finished compares the live
+--- destination against this to catch a player or another mod taking over
+--- while a request was in flight.
+local function set_autopilot(entity, nav, dest)
+  local ok = pcall(function()
+    entity.autopilot_destination = dest
+  end)
+  if ok and nav then
+    nav.dest_set = dest and {x = dest.x, y = dest.y} or false
+  end
+  return ok
+end
 
 --- Vehicle hooks: spidertron defaults, overridable per order via opts so
 --- future non-spider callers can plug in their own accessors.
@@ -173,11 +280,12 @@ local function request_path(rec)
     nav.request_id = nil
   end
   nav.path_goal = {x = nav.goal.x, y = nav.goal.y}
+  local start, bounding_box, mask = path_origin(rec)
   local ok, request_id = pcall(function()
     return entity.surface.request_path {
-      bounding_box = entity.prototype.collision_box,
-      collision_mask = opts.collision_mask or SPIDER_PATH_MASK,
-      start = entity.position,
+      bounding_box = bounding_box,
+      collision_mask = mask,
+      start = start,
       goal = nav.goal,
       force = entity.force,
       --- Without this the requester's own box blocks the start position:
@@ -217,9 +325,7 @@ local function feed_waypoints(entity, nav)
   if not (wps and idx and wps[idx]) then
     return
   end
-  local ok = pcall(function()
-    entity.autopilot_destination = wps[idx]
-  end)
+  local ok = set_autopilot(entity, nav, wps[idx])
   if not ok then
     return
   end
@@ -267,7 +373,7 @@ function Pathing.order_move(rec, goal, opts)
   end
   --- A goal sitting on water is unreachable: snap it to the nearest shore
   --- (patrol/engage points, stray remote clicks) instead of stalling.
-  local snapped = o.snap_to_land and Util.nearest_land(entity.surface, goal, 32) or goal
+  local snapped = o.snap_to_land and snap_goal(entity, goal) or goal
   rec.nav = {
     goal = {x = snapped.x, y = snapped.y},
     request_id = nil,
@@ -285,25 +391,13 @@ function Pathing.order_move(rec, goal, opts)
   --- every queued node, instead of straight-lining toward the goal and
   --- pressing water while the request is in flight. Clear any queued
   --- destinations first so a superseded leg isn't walked.
-  pcall(function()
-    entity.autopilot_destination = nil
-  end)
-  --- Entity standing on a blocked tile: the requester position collides, so
-  --- every request fails. Point it at the goal — with shore in leg reach it
-  --- walks itself out on vanilla autopilot; otherwise it stalls into the
-  --- watchdog and blacklist.
-  if Util.is_blocked(entity.surface, entity.position) then
-    pcall(function()
-      entity.autopilot_destination = snapped
-    end)
-    return
-  end
+  set_autopilot(entity, nav, nil)
+  --- Even a torso wedged on blocked terrain still gets a request: the
+  --- entity origin fails but leg origins straddle what blocks the body.
   --- This goal just failed for someone: don't burn another request on it —
   --- straight-line there (empty-path rate was ~5/s of retry spam).
   if goal_blacklisted(entity, snapped) then
-    pcall(function()
-      entity.autopilot_destination = snapped
-    end)
+    set_autopilot(entity, nav, snapped)
     nav.failed = true
     return
   end
@@ -311,9 +405,7 @@ function Pathing.order_move(rec, goal, opts)
   --- No request fired: short hop, or the API rejected the call — straight
   --- line is the only option left.
   if not nav.request_id then
-    pcall(function()
-      entity.autopilot_destination = snapped
-    end)
+    set_autopilot(entity, nav, snapped)
   end
 end
 
@@ -339,6 +431,28 @@ function Pathing.on_path_finished(rec, event)
   if not (entity and entity.valid and nav.goal) then
     return
   end
+  --- Abort-on-external-control: someone else wrote autopilot_destination
+  --- while the request was in flight (player click, another mod). The
+  --- spider is theirs now — drop the route instead of stomping it. A nil
+  --- destination means nobody is driving, so the path still applies.
+  local ok_ext, cur_dest = pcall(function()
+    return entity.autopilot_destination
+  end)
+  if ok_ext and cur_dest then
+    local ours = same_pos(cur_dest, nav.dest_set) or same_pos(cur_dest, nav.goal)
+    if not ours and nav.waypoints then
+      for i = nav.wp_index or 1, #nav.waypoints do
+        if same_pos(cur_dest, nav.waypoints[i]) then
+          ours = true
+          break
+        end
+      end
+    end
+    if not ours then
+      Pathing.reset(rec)
+      return
+    end
+  end
   local opts = nav.opts or {}
   local path = event.path
 
@@ -362,8 +476,16 @@ function Pathing.on_path_finished(rec, event)
     if game.tick % 600 == 0 then
       log("lib-spidertron-pathing: path empty on " .. entity.surface.name .. " goal=" .. math.floor(nav.goal.x) .. "," .. math.floor(nav.goal.y))
     end
-    nav.retry_count = (nav.retry_count or 0) + 1
-    if nav.retry_count <= MAX_RETRIES then
+    --- Torso origin failed: retry from the next odd leg — legs straddle
+    --- obstacles that wedge the body. Only when every leg has failed does
+    --- the retry budget advance a full round through all origins.
+    local can_retry = next_leg_origin(entity, nav)
+    if not can_retry then
+      nav.origin_idx = 0
+      nav.retry_count = (nav.retry_count or 0) + 1
+      can_retry = nav.retry_count <= MAX_RETRIES
+    end
+    if can_retry then
       nav.path_goal = nil --- retry must bypass the same-goal dedupe
       request_path(rec)
     else
@@ -373,9 +495,7 @@ function Pathing.on_path_finished(rec, event)
       --- purposes that need arrival (mission, resupply, command) do.
       blacklist_map()[goal_key(entity.surface.index, nav.goal)] = game.tick
       if not opts.skip_straightline_fallback[nav.purpose] then
-        pcall(function()
-          entity.autopilot_destination = nav.goal
-        end)
+        set_autopilot(entity, nav, nav.goal)
       end
       nav.failed = true
     end
@@ -421,6 +541,7 @@ function Pathing.on_path_finished(rec, event)
   nav.wp_index = 1
   nav.stall_since = nil
   nav.retry_count = 0
+  nav.origin_idx = 0
   sync_wp_index(entity, nav)
   if nav.wp_index <= #wps then
     feed_waypoints(entity, nav)
@@ -446,11 +567,38 @@ function Pathing.tick(rec)
   --- (event never resolves) and we fall through to repath/fail handling.
   if nav.request_id then
     if (game.tick - (nav.request_since or 0)) <= REQUEST_TIMEOUT then
+      --- Waiting on the pathfinder: restart the position window so a
+      --- just-applied route isn't repathed before it can move.
+      nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+      nav.stuck_tick = game.tick
       return
     end
     Pathing.take_request(nav.request_id)
     nav.request_id = nil
     nav.path_goal = nil
+  end
+
+  --- Position watchdog: the speed-based stall checks below miss a spider
+  --- shuffling in place or creeping just over STALL_SPEED — if it covered
+  --- less than ~1.5 tiles in ~180 ticks with a goal pending, drop whatever
+  --- the autopilot is doing and re-request the path.
+  local now = game.tick
+  if nav.stuck_pos and (now - (nav.stuck_tick or now)) >= STUCK_TICKS then
+    local moved = Util.distance_sq(entity.position, nav.stuck_pos)
+    nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+    nav.stuck_tick = now
+    if moved < STUCK_DIST_SQ and not nav.failed and not Pathing.arrived(rec) then
+      set_autopilot(entity, nav, nil)
+      nav.origin_idx = 0
+      nav.path_goal = nil
+      request_path(rec)
+      if nav.request_id then
+        return
+      end
+    end
+  elseif not nav.stuck_pos then
+    nav.stuck_pos = {x = entity.position.x, y = entity.position.y}
+    nav.stuck_tick = now
   end
 
   --- Last-meter settle: the engine drops the autopilot destination at its
@@ -466,9 +614,7 @@ function Pathing.tick(rec)
     if (not dest or Util.distance_sq(dest, nav.goal) > 4)
       and (nav.settle_count or 0) < 6 then
       nav.settle_count = (nav.settle_count or 0) + 1
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
       return
     end
   end
@@ -505,6 +651,7 @@ function Pathing.tick(rec)
   nav.repath_count = (nav.repath_count or 0) + 1
   if nav.repath_count <= MAX_REPATHS then
     nav.retry_count = 0
+    nav.origin_idx = 0
     nav.path_goal = nil --- re-request must bypass the same-goal dedupe
     request_path(rec)
   else
@@ -512,9 +659,7 @@ function Pathing.tick(rec)
     --- straddles what it can — but only for goals that need arrival.
     --- Skipped purposes (patrol by default) get dead-marked and skipped.
     if not nav.opts.skip_straightline_fallback[nav.purpose] then
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
     end
     nav.failed = true
   end
@@ -619,9 +764,7 @@ function Pathing.on_command_completed(rec)
     --- destination again. Skipped once actually arrived/stopped.
     if (nav.settle_count or 0) < 3 and not Pathing.arrived(rec) then
       nav.settle_count = (nav.settle_count or 0) + 1
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
     end
     return
   end
@@ -679,8 +822,8 @@ function Pathing.cancel(rec)
   end
   local entity = rec.entity
   if entity and entity.valid then
+    set_autopilot(entity, nav, nil)
     pcall(function()
-      entity.autopilot_destination = nil
       stop_entity(entity, nav and nav.opts)
     end)
   end
