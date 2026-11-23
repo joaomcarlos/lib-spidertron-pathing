@@ -164,6 +164,24 @@ local function snap_goal(entity, goal)
   return Util.nearest_land(entity.surface, goal, 32)
 end
 
+local function same_pos(a, b)
+  return a and b and math.abs(a.x - b.x) < 0.75 and math.abs(a.y - b.y) < 0.75
+end
+
+--- autopilot_destination write that records what we set in nav.dest_set
+--- ({x,y}, or false for a clear). on_path_finished compares the live
+--- destination against this to catch a player or another mod taking over
+--- while a request was in flight.
+local function set_autopilot(entity, nav, dest)
+  local ok = pcall(function()
+    entity.autopilot_destination = dest
+  end)
+  if ok and nav then
+    nav.dest_set = dest and {x = dest.x, y = dest.y} or false
+  end
+  return ok
+end
+
 --- Vehicle hooks: spidertron defaults, overridable per order via opts so
 --- future non-spider callers can plug in their own accessors.
 local function entity_speed(entity, opts)
@@ -305,9 +323,7 @@ local function feed_waypoints(entity, nav)
   if not (wps and idx and wps[idx]) then
     return
   end
-  local ok = pcall(function()
-    entity.autopilot_destination = wps[idx]
-  end)
+  local ok = set_autopilot(entity, nav, wps[idx])
   if not ok then
     return
   end
@@ -373,17 +389,13 @@ function Pathing.order_move(rec, goal, opts)
   --- every queued node, instead of straight-lining toward the goal and
   --- pressing water while the request is in flight. Clear any queued
   --- destinations first so a superseded leg isn't walked.
-  pcall(function()
-    entity.autopilot_destination = nil
-  end)
+  set_autopilot(entity, nav, nil)
   --- Even a torso wedged on blocked terrain still gets a request: the
   --- entity origin fails but leg origins straddle what blocks the body.
   --- This goal just failed for someone: don't burn another request on it —
   --- straight-line there (empty-path rate was ~5/s of retry spam).
   if goal_blacklisted(entity, snapped) then
-    pcall(function()
-      entity.autopilot_destination = snapped
-    end)
+    set_autopilot(entity, nav, snapped)
     nav.failed = true
     return
   end
@@ -391,9 +403,7 @@ function Pathing.order_move(rec, goal, opts)
   --- No request fired: short hop, or the API rejected the call — straight
   --- line is the only option left.
   if not nav.request_id then
-    pcall(function()
-      entity.autopilot_destination = snapped
-    end)
+    set_autopilot(entity, nav, snapped)
   end
 end
 
@@ -418,6 +428,28 @@ function Pathing.on_path_finished(rec, event)
   local entity = rec.entity
   if not (entity and entity.valid and nav.goal) then
     return
+  end
+  --- Abort-on-external-control: someone else wrote autopilot_destination
+  --- while the request was in flight (player click, another mod). The
+  --- spider is theirs now — drop the route instead of stomping it. A nil
+  --- destination means nobody is driving, so the path still applies.
+  local ok_ext, cur_dest = pcall(function()
+    return entity.autopilot_destination
+  end)
+  if ok_ext and cur_dest then
+    local ours = same_pos(cur_dest, nav.dest_set) or same_pos(cur_dest, nav.goal)
+    if not ours and nav.waypoints then
+      for i = nav.wp_index or 1, #nav.waypoints do
+        if same_pos(cur_dest, nav.waypoints[i]) then
+          ours = true
+          break
+        end
+      end
+    end
+    if not ours then
+      Pathing.reset(rec)
+      return
+    end
   end
   local opts = nav.opts or {}
   local path = event.path
@@ -461,9 +493,7 @@ function Pathing.on_path_finished(rec, event)
       --- purposes that need arrival (mission, resupply, command) do.
       blacklist_map()[goal_key(entity.surface.index, nav.goal)] = game.tick
       if not opts.skip_straightline_fallback[nav.purpose] then
-        pcall(function()
-          entity.autopilot_destination = nav.goal
-        end)
+        set_autopilot(entity, nav, nav.goal)
       end
       nav.failed = true
     end
@@ -555,9 +585,7 @@ function Pathing.tick(rec)
     if (not dest or Util.distance_sq(dest, nav.goal) > 4)
       and (nav.settle_count or 0) < 6 then
       nav.settle_count = (nav.settle_count or 0) + 1
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
       return
     end
   end
@@ -602,9 +630,7 @@ function Pathing.tick(rec)
     --- straddles what it can — but only for goals that need arrival.
     --- Skipped purposes (patrol by default) get dead-marked and skipped.
     if not nav.opts.skip_straightline_fallback[nav.purpose] then
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
     end
     nav.failed = true
   end
@@ -709,9 +735,7 @@ function Pathing.on_command_completed(rec)
     --- destination again. Skipped once actually arrived/stopped.
     if (nav.settle_count or 0) < 3 and not Pathing.arrived(rec) then
       nav.settle_count = (nav.settle_count or 0) + 1
-      pcall(function()
-        entity.autopilot_destination = nav.goal
-      end)
+      set_autopilot(entity, nav, nav.goal)
     end
     return
   end
@@ -769,8 +793,8 @@ function Pathing.cancel(rec)
   end
   local entity = rec.entity
   if entity and entity.valid then
+    set_autopilot(entity, nav, nil)
     pcall(function()
-      entity.autopilot_destination = nil
       stop_entity(entity, nav and nav.opts)
     end)
   end
